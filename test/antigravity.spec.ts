@@ -3,6 +3,7 @@
 import { test } from 'node:test'
 import type { InputBlock } from '../src/translate/resolved.js'
 import { ToolCallId } from '../src/compat.js'
+import type { CompatibleContentBlock as ContentBlock, CompatibleMessage } from '../src/compat.js'
 import { AccountTokenManager } from '../src/providers/accounts.js'
 import assert from 'node:assert/strict'
 import { LlmError, MessageId } from '@deepseek-ai/dsh-llm'
@@ -29,7 +30,7 @@ import {
   toAntigravityRequest,
 } from '../src/translate/antigravity.js'
 import { withToolResultBlocks } from '../src/translate/resolved.js'
-import type { TranslatableMessage } from '../src/translate/resolved.js'
+import type { ToolRoleMessage, TranslatableMessage } from '../src/translate/resolved.js'
 
 const oauth = { clientId: 'test-client.apps.example.invalid', clientSecret: 'test-secret' }
 const runtime = { baseURL: 'https://antigravity.example.invalid', onboard: false }
@@ -199,7 +200,7 @@ test('request conversion carries system, images, tools, tool results, and signed
       content: [{ type: 'image', mediaType: 'image/png', dataBase64: 'aGVsbG8=' }],
     },
   ]
-  const payload = toAntigravityRequest(options(messages as Message[]), messages, 'project-123')
+  const payload = toAntigravityRequest(options([]), messages, 'project-123')
   assert.equal(payload.project, 'project-123')
   assert.equal(payload.request.systemInstruction?.parts[0].text, 'Be useful.')
   assert.equal(payload.request.tools?.[0].functionDeclarations[0].name, 'bash')
@@ -258,6 +259,21 @@ test('tool errors with JSON output keep their error flag', () => {
   })
 })
 
+test('failed tool results preserve their error flag in current and legacy histories', () => {
+  for (const text of ['permission denied', '{"error":"denied","isError":false}', '["denied"]']) {
+    const content = [{ type: 'text' as const, text }]
+    const results: ToolRoleMessage[] = [
+      { role: 'tool', toolCallId: 'failed-call', isError: true, content },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: ToolCallId('failed-call'), isError: true, content }] },
+    ]
+    for (const result of results) {
+      const messages = withToolResultBlocks([message('assistant', [{ type: 'tool-call', id: ToolCallId('failed-call'), name: 'bash', arguments: '{}' }]), result])
+      const parts = toAntigravityRequest(options([]), messages, 'project-123').request.contents.flatMap(entry => entry.parts)
+      assert.equal(parts[1]?.functionResponse?.response.isError, true, `${result.role}: ${text}`)
+    }
+  }
+})
+
 test('stream translator emits reasoning, text, tool call, usage, finish, and replay signature', () => {
   const translator = new AntigravityStreamTranslator()
   const chunks = translator.push({
@@ -313,7 +329,7 @@ test('streamGenerateContent SSE and generateContent URL/forwarding are both supp
   assert.deepEqual(streamed.map(chunk => chunk.type), ['block-start', 'text-delta', 'block-end', 'finish'])
 
   const calls: RecordedCall[] = []
-  const payload = toAntigravityRequest(options([message('user', [{ type: 'text', text: 'hi' }])]), [
+  const payload = toAntigravityRequest(options([]), [
     message('user', [{ type: 'text', text: 'hi' }]),
   ], session.projectId)
   await requestAntigravityContent(session, payload, false, runtime, routed({
@@ -763,12 +779,12 @@ test('Antigravity replays signed text and reasoning only for the same provider a
     ] },
   }
   const messages = [message('assistant', [{ type: 'reasoning', text: 'thought' }, { type: 'text', text: 'answer' }], source)]
-  const payload = toAntigravityRequest(options(messages), messages, session.projectId)
+  const payload = toAntigravityRequest(options([]), messages, session.projectId)
   assert.deepEqual(payload.request.contents[0].parts, [
     { thought: true, text: 'thought', thoughtSignature: 'reasoning-signature' },
     { text: 'answer', thoughtSignature: 'text-signature' },
   ])
-  const changed = toAntigravityRequest({ ...options(messages), model: 'claude-sonnet-4-6' }, messages, session.projectId)
+  const changed = toAntigravityRequest({ ...options([]), model: 'claude-sonnet-4-6' }, messages, session.projectId)
   assert.deepEqual(changed.request.contents[0].parts, [{ text: 'answer' }])
 })
 

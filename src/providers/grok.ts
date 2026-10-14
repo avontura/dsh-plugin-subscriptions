@@ -619,6 +619,8 @@ export interface GrokAdapterOptions {
   resolveAttachments?: () => AttachmentStore | undefined
   /** Durable catalog store seeding capability metadata across restarts. */
   catalogStore?: CatalogPersistence
+  onCatalogChanged?: () => void
+  accountCatalogStore?: (account: string) => CatalogPersistence
   /**
    * Per-model default reasoning effort override (the Settings page's picker).
    * Returns the user-configured default for one model, or undefined to follow
@@ -635,7 +637,12 @@ export class GrokAdapter extends LlmAdapter {
 
   constructor(private readonly options: GrokAdapterOptions) {
     super()
-    this.catalogs = new AccountCatalogCache(options.catalogStore, () => options.tokens.defaultAccount())
+    this.catalogs = new AccountCatalogCache(
+      options.catalogStore,
+      () => options.tokens.defaultAccount(),
+      options.accountCatalogStore,
+      options.onCatalogChanged,
+    )
   }
 
   /** Discovery fetcher: resolves the session through the refresh-aware path. */
@@ -687,7 +694,7 @@ export class GrokAdapter extends LlmAdapter {
   }
 
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    const own = await this.listOwnModels(provider)
+    const own = await this.listOwnModels(provider, undefined, undefined, true)
     const pool = this.options.pool?.()
     if (pool === undefined) return own
     const extra = await pool.modelsForProvider(provider as ProviderId)
@@ -697,13 +704,13 @@ export class GrokAdapter extends LlmAdapter {
   }
 
   /** The provider's own catalog: union of every account, or one account when named. */
-  async listOwnModels(provider: string, account?: string, signal?: AbortSignal): Promise<readonly LlmModelInfo[]> {
+  async listOwnModels(provider: string, account?: string, signal?: AbortSignal, preferCached = false): Promise<readonly LlmModelInfo[]> {
     if (account === undefined) {
       const accounts = (await this.options.tokens.list()).map(entry => entry.key)
       if (accounts.length === 0) return []
       return unionAccountCatalogs(
         accounts,
-        (key, accountSignal) => this.listOwnModels(provider, key, accountSignal),
+        (key, accountSignal) => this.listOwnModels(provider, key, accountSignal, preferCached),
         { timeoutMs: DISCOVERY_TIMEOUT_MS, ...signal === undefined ? {} : { signal } },
       )
     }
@@ -716,11 +723,11 @@ export class GrokAdapter extends LlmAdapter {
       // The fetcher runs only on a cache miss, and resolves the session
       // through the refresh-aware path so an expired access token renews here
       // instead of failing discovery into the static fallback.
-      return this.listed(provider, await discoverOrRetryAuth(
+      return this.listed(provider, await catalog.get(() => discoverOrRetryAuth(
         force => this.options.tokens.session(account, force),
         catalog,
-        () => catalog.get(() => this.fetchCatalog(account, signal)),
-      ))
+        () => this.fetchCatalog(account, signal),
+      ), preferCached))
     } catch (error: unknown) {
       if (isDiscoveryAborted(error, signal)) throw error
       // A permanent refresh failure deletes the stored session: the provider

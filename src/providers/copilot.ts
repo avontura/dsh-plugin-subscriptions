@@ -616,6 +616,8 @@ export interface CopilotAdapterOptions {
   resolveAttachments?: () => AttachmentStore | undefined
   /** Durable catalog store seeding capability metadata across restarts. */
   catalogStore?: CatalogPersistence
+  onCatalogChanged?: () => void
+  accountCatalogStore?: (account: string) => CatalogPersistence
   /** How long this route may hold a turn open waiting for a rate-limit window; defaults to waiting on, six-hour ceiling. */
   rateLimit?: RateLimitWait
   /**
@@ -656,7 +658,12 @@ export class CopilotAdapter extends LlmAdapter {
 
   constructor(private readonly options: CopilotAdapterOptions) {
     super()
-    this.catalogs = new AccountCatalogCache(options.catalogStore, () => options.tokens.defaultAccount())
+    this.catalogs = new AccountCatalogCache(
+      options.catalogStore,
+      () => options.tokens.defaultAccount(),
+      options.accountCatalogStore,
+      options.onCatalogChanged,
+    )
   }
 
   /** Discovery fetcher: resolves the session through the refresh-aware path. */
@@ -691,7 +698,7 @@ export class CopilotAdapter extends LlmAdapter {
   }
 
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    const own = await this.listOwnModels(provider)
+    const own = await this.listOwnModels(provider, undefined, undefined, true)
     const pool = this.options.pool?.()
     if (pool === undefined) return own
     const extra = await pool.modelsForProvider(provider as ProviderId)
@@ -701,13 +708,13 @@ export class CopilotAdapter extends LlmAdapter {
   }
 
   /** The provider's own catalog: union of every account, or one account when named. */
-  async listOwnModels(provider: string, account?: string, signal?: AbortSignal): Promise<readonly LlmModelInfo[]> {
+  async listOwnModels(provider: string, account?: string, signal?: AbortSignal, preferCached = false): Promise<readonly LlmModelInfo[]> {
     if (account === undefined) {
       const accounts = (await this.options.tokens.list()).map(entry => entry.key)
       if (accounts.length === 0) return []
       return unionAccountCatalogs(
         accounts,
-        (key, accountSignal) => this.listOwnModels(provider, key, accountSignal),
+        (key, accountSignal) => this.listOwnModels(provider, key, accountSignal, preferCached),
         { timeoutMs: DISCOVERY_TIMEOUT_MS, ...signal === undefined ? {} : { signal } },
       )
     }
@@ -720,11 +727,11 @@ export class CopilotAdapter extends LlmAdapter {
       // The fetcher runs only on a cache miss, and resolves the session
       // through the refresh-aware path so an expired access token renews here
       // instead of failing discovery into the static fallback.
-      const discovered = await discoverOrRetryAuth(
+      const discovered = await catalog.get(() => discoverOrRetryAuth(
         force => this.options.tokens.session(account, force),
         catalog,
-        () => catalog.get(() => this.fetchCatalog(account, signal)),
-      )
+        () => this.fetchCatalog(account, signal),
+      ), preferCached)
       return discovered.map(model => ({
         provider,
         id: model.id,
@@ -779,17 +786,19 @@ export class CopilotAdapter extends LlmAdapter {
    * account identity is the session's long-lived GitHub token (stable across
    * Copilot-token refreshes, different per GitHub login); the conversation is
    * the loop-stamped `sessionId`, falling back to the first message's id
-   * when a hand-built request carries no session stamp; the model separates
+   * when a hand-built request carries no session stamp. Identity-free
+   * requests have no replay scope; the model separates
    * wire families. A call id captured in one scope is invisible to every
    * other scope, so reused ids cannot leak reasoning across accounts,
    * conversations, or models.
    */
-  private replayScope(tokenKey: string, options: GenerateOptions): string {
+  private replayScope(tokenKey: string, options: GenerateOptions): string | undefined {
     const conversation = options.sessionId !== undefined
       ? `session:${String(options.sessionId)}`
-      : options.messages[0] !== undefined
+      : options.messages[0]?.id !== undefined
         ? `anchor:${String(options.messages[0].id)}`
-        : 'conversation:none'
+        : undefined
+    if (conversation === undefined) return undefined
     return `${tokenKey}\u0000${conversation}\u0000${options.model}`
   }
 
@@ -804,10 +813,11 @@ export class CopilotAdapter extends LlmAdapter {
    * per call.
    */
   private captureReasoning(
-    scope: string,
+    scope: string | undefined,
     callIds: readonly string[],
     items: readonly ReasoningReplayItem[],
   ): void {
+    if (scope === undefined) return
     let entries = this.replayByScope.get(scope)
     if (entries === undefined) {
       entries = new Map<string, ReasoningReplayEntry>()
@@ -847,7 +857,8 @@ export class CopilotAdapter extends LlmAdapter {
    * absent or aged-out entry answers `undefined` — the no-replay
    * degradation, never an error.
    */
-  private replayFor(scope: string, callId: string): readonly ReasoningReplayItem[] | undefined {
+  private replayFor(scope: string | undefined, callId: string): readonly ReasoningReplayItem[] | undefined {
+    if (scope === undefined) return undefined
     const entries = this.replayByScope.get(scope)
     const entry = entries?.get(callId)
     if (entries === undefined || entry === undefined) return undefined
@@ -972,7 +983,7 @@ export class CopilotAdapter extends LlmAdapter {
     session: CopilotSession,
     signal: AbortSignal,
     wire: CopilotWire,
-    replayScopeKey: string,
+    replayScopeKey: string | undefined,
   ): Promise<Response> {
     const hasVision = hasImages(messages)
     const body = wire === 'responses'

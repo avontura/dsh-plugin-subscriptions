@@ -17,6 +17,13 @@ import type { ProviderUsage } from '../providers/common.js'
 import type { ProxyConfigView, ProxyDraft, ProxyInput, ProxyTestResult } from '../http.js'
 import type { CliVersion } from '../providers/npm-cli-version.js'
 
+/** Internal endpoint dispatcher used after the host authenticates an exact Fetch route. */
+export type SubscriptionsRpcHandler = (
+  endpoint: string,
+  payload: unknown,
+  signal: AbortSignal,
+) => Promise<RpcResult<unknown>>
+
 /**
  * Endpoint-name prefix under the shared `/api` channel: endpoint `status`
  * is served at `/api/subscriptions-auth.status`. The browser half calls
@@ -31,7 +38,7 @@ export const SUBSCRIPTIONS_AUTH_PREFIX = 'subscriptions-auth.'
 export const SUBSCRIPTIONS_AUTH_ENDPOINTS = [
   'providerSettings', 'setProviderSettings',
   'status', 'login', 'manual', 'cancel', 'logout', 'setDefault', 'usage',
-  'image', 'video',
+  'image', 'video', 'prepareReset', 'consumeReset',
   'speed', 'setSpeed',
   'proxyGet', 'proxySet', 'proxyTest',
   'modelDefaults', 'setModelDefault',
@@ -90,6 +97,7 @@ export interface AccountStatus {
 
 /** Login state of one provider, as rendered by the Settings page. */
 export interface ProviderStatus {
+  displayName?: string
   /** Whether a login attempt is currently waiting for its code. */
   busy: boolean
   /** Logged-in accounts, default first. */
@@ -135,6 +143,8 @@ export interface ModelDefaultsCatalog {
 
 /** Provider and account preference operations behind providerSettings/setProviderSettings. */
 export interface ProviderSettingsController {
+  /** Local preferences only: status must not fetch a model catalog. */
+  displayName?(provider: ProviderId): string | undefined
   get(provider: ProviderId, force: boolean): Promise<unknown>
   set(provider: ProviderId, settings: unknown): Promise<void>
 }
@@ -148,6 +158,8 @@ export interface ModelDefaultsController {
 
 /** Provider-agnostic auth operations the RPC handler delegates to. */
 export interface AuthController {
+  prepareReset?(account: string, signal: AbortSignal): Promise<unknown>
+  consumeReset?(account: string, ticket: string, signal: AbortSignal): Promise<void>
   /** Current status of one provider. */
   status(provider: ProviderId): Promise<ProviderStatus>
   /**
@@ -239,9 +251,6 @@ function serverResponse(rpcId: string, result: RpcResult<unknown>): Response {
   return Response.json({ type: 'server-response', rpcId, result })
 }
 
-/** Internal dispatcher; the enclosing Fetch route owns connection admission. */
-type AuthRpcHandler = (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<RpcResult<unknown>>
-
 /**
  * Wrap one endpoint's RPC handler as an exact Fetch route: decode the
  * `client-request` envelope the browser rpc caller posts, run the handler,
@@ -250,7 +259,7 @@ type AuthRpcHandler = (endpoint: string, payload: unknown, signal: AbortSignal) 
  * `rpc.call('/api', 'subscriptions-auth.<endpoint>', payload)` keeps working
  * unchanged on the browser side.
  */
-function fetchRouteFor(endpoint: string, handler: AuthRpcHandler): FetchRouteCompat {
+function fetchRouteFor(endpoint: string, handler: SubscriptionsRpcHandler): FetchRouteCompat {
   const method = `${SUBSCRIPTIONS_AUTH_PREFIX}${endpoint}`
   return {
     path: `/api/${method}`,
@@ -528,7 +537,10 @@ async function dispatch(
           detail: error instanceof Error ? error.message : String(error),
         }) satisfies ProviderStatus)] as const,
       ))
-      return ok({ providers: Object.fromEntries(entries) })
+      return ok({ providers: Object.fromEntries(entries.map(([provider, status]) => {
+        const displayName = providerSettings?.displayName?.(provider)
+        return [provider, { ...status, ...(displayName ? { displayName } : {}) }]
+      })) })
     }
     case 'login': {
       const provider = readProvider(payload)
@@ -556,6 +568,13 @@ async function dispatch(
       const provider = readProvider(payload)
       return ok(await controller.usage(provider, readString(payload, 'account'), signal, readForce(payload)))
     }
+    case 'prepareReset':
+      if (!controller.prepareReset) throw new BadRequest('Reset redemption unavailable')
+      return ok(await controller.prepareReset(readString(payload, 'account'), signal))
+    case 'consumeReset':
+      if (!controller.consumeReset) throw new BadRequest('Reset redemption unavailable')
+      await controller.consumeReset(readString(payload, 'account'), readString(payload, 'ticket'), signal)
+      return ok({ ok: true })
     case 'image':
       return ok(await controller.readImage(readImageRef(payload), signal))
     case 'video':
@@ -620,7 +639,7 @@ export function registerAuthRpc(
   // routes below it work on both dsh lines.
   ctx.inject(['connection'], (ctx) => {
     const connection = ctx.get('connection') as HostConnectionHandle
-    const handler: AuthRpcHandler = async (endpoint, payload, signal) => {
+    const handler: SubscriptionsRpcHandler = async (endpoint, payload, signal) => {
       try {
         return await dispatch(controller, speed, proxy, modelDefaults, endpoint, payload, signal, providerSettings)
       } catch (error) {
