@@ -4,6 +4,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { registerHooks } from 'node:module'
 import type { ToolCallBlock } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 
 const css = registerHooks({ load(url, context, nextLoad) {
   return url.endsWith('.css')
@@ -21,6 +22,7 @@ for (const [name, Component] of [
   test(`${name} renders preparation without arguments and shows the prompt after dispatch`, () => {
     const block: ToolCallBlock = {
       phase: 'preparing', callId: 'call', name, turn: 1, step: 1, time: 1, subCalls: [],
+      args: PartialArguments.EMPTY,
     }
     const preparing = renderToStaticMarkup(createElement(Component, { block }))
     assert.ok(preparing.includes(name))
