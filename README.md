@@ -34,9 +34,13 @@ Models that advertise reasoning levels get an **Effort** selector in the same me
 
 Codex models whose catalog advertises the fast tier (the codex CLI's fast mode) get a **Speed** toggle in the composer's tool row, next to the model selector — Standard or Fast (`service_tier: priority`), per session. The `/fast` slash command offers the same choice as a popup; it errors with an explanation when the current model has no fast tier.
 
+Subagents have a separate per-model default: **Settings → Subscriptions → ChatGPT (Codex) → Manage → Edit model list → Subagent default speed**. Save changes to apply it to subsequent requests, including running subagents. This setting persists across restarts and works regardless of the parent model; main-session Speed choices do not propagate to children. A speed explicitly selected in a child session overrides its model default, including Standard. Explicit session choices reset on restart. Fast still requires catalog support for the actual Codex model. Hosts without live agent origin metadata keep Standard unless the session has an explicit speed choice.
+
 ![Speed toggle with the Standard/Fast menu open](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/speed-toggle.png)
 
-The composer's stats row gains a **subscription usage** pill showing the remaining rate-limit window for the provider of the session's current model (Codex when a GPT model is selected, Grok for a Grok model, and so on). Click it to expand every logged-in provider and account — the default account is starred, and the current provider is listed first:
+The composer's stats row gains a **subscription usage** pill showing the used percentage and reset window for the provider of the session's current model (Codex for a Codex model, Grok for a Grok model, and so on). It shows at most one provider: when switching to a non-subscription model, it keeps the most recent subscription selected in the mounted conversation view, or stays hidden if there is none. This recent-model history is not persisted across page reloads. Click the pill to expand every logged-in provider and account — the default account is starred, and the current provider is listed first. Antigravity previews only the current model's windows (at most two per account); the other model windows remain available in a closed disclosure.
+
+**Settings → Subscriptions → Status-bar quota display** selects **Current / most recent subscription only** (default) or **Hidden**. The display preference is saved in the current browser, applies immediately, survives reloads, and synchronizes between tabs of the same origin. It does not hide usage details in Settings, change model selection, or change account routing.
 
 ![Subscription usage pill expanded to show every provider and account](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/usage-badge.png)
 
@@ -84,7 +88,13 @@ Image generation and editing share same-provider account scheduling: try the def
 
 ### DSH compatibility
 
-The current release targets DSH `0.2.0-rc.2` and its updated client and message APIs. Upgrade DSH before using this plugin revision.
+DSH peers use two short ranges with no upper bound: `>=0.2.0-rc.2 || >=0.2.1-0`. The first retains the minimum supported version; the second admits all `0.2.1` alpha/RC builds under npm/pnpm's default peer matching, avoiding version-mismatch warnings from these five DSH peers for that release line. Maintain one prerelease anchor per supported release line, not an entry for every RC. Development dependencies remain pinned to `0.2.1-rc.5`.
+
+Harness uses `includePrerelease: true` and admits all versions at or above the minimum, including future prereleases. npm/pnpm default matching admits later stable versions but requires an explicit prerelease anchor for each new release line (for example, `>=0.2.2-0` for `0.2.2` prereleases). There is no upper bound: future incompatible releases are not blocked, and admission does not guarantee runtime compatibility.
+
+In DSH `0.2.1-rc.2`, the load-time check uses `engines.dsh` when declared; otherwise, every `@deepseek-ai/dsh` and `@deepseek-ai/dsh-*` peer must match the running DSH version. Prereleases participate in this check. This plugin does not declare `engines.dsh`, so its DSH peer ranges determine whether it can load. The `@deepseek-ai/cordis` and `@deepseek-ai/schemastery` peers affect package-manager dependency resolution, not this load-time check. They keep their `^4.0.1` / `^3.18.1` floors and also list the `4.0.5-alpha` / `3.18.5-alpha` builds bundled with DSH `0.2.1-alpha.2` and `0.2.1-alpha.3`, because those caret ranges exclude these prereleases under npm's default semver rules.
+
+DSH `0.1.x` is no longer supported. Users on that line must upgrade to a supported DSH version or retain an older compatible plugin release.
 
 ### Managing accounts and pool models
 
@@ -97,6 +107,8 @@ The model picker uses saved catalogs immediately, including catalogs for non-def
 In **Settings → Subscriptions → provider → Edit model list**, use **Refresh** to fetch the current catalog immediately and update the conversation model picker. Successful background updates also invalidate the picker cache. This is separate from subscription-usage and credential refresh, whose behavior is unchanged. If `models.<provider>` is explicitly configured with a non-empty list, that list still overrides discovery.
 
 Codex catalog visibility depends on the `client_version` request parameter. By default the plugin reads the stable version from the official npm `@openai/codex` package's public metadata (no CLI installation or subscription credentials sent to npm). Successful lookups are cached in memory for six hours; failures retry after five minutes and retain the last successful version, or the verified `0.153.4` fallback on first use. The lookup has a 5-second deadline, shares in-flight work across accounts, and ignores prerelease or regressed versions. On load the plugin also raises Node's Happy Eyeballs per-address connect attempt timeout to at least 1.5 seconds (never lowering a larger host value), because the 250ms default drops every connection on links where one TCP handshake takes longer than that. Manual model-list refresh also rechecks the version. An explicit plugin configuration field, `codexClientVersion: '0.153.4'`, takes precedence and disables automatic lookup; restart DSH after changing it. Model availability remains account-dependent; see [verification notes](docs/codex-catalog-refresh.md).
+
+Claude requests present themselves as Claude Code, and the endpoint gates newer models on the Claude Code version (for example, Opus 5.5 requires 2.1.280 or newer). The plugin therefore reads the `latest` version from the official npm `@anthropic-ai/claude-code` package's public metadata, with the same caching, deadline, and retry rules as the Codex lookup, and no subscription credentials sent to npm. It never presents a version older than the locally installed `claude` CLI or the bundled fallback, which is also what it uses while npm is unreachable. Manual model-list refresh also rechecks the version. **Settings → Subscriptions** shows the version Codex and Claude currently present next to each name, along with its source: the latest on npm, the local CLI, the built-in fallback, or your configured value. A fallback there means the npm lookup is not getting through.
 
 ### Installation commands
 
@@ -306,10 +318,14 @@ This plugin only supplies model routes. Approval policy lives elsewhere:
 ## Develop
 
 ```sh
-pnpm install   # development baseline: published DSH 0.2.0-rc.2 packages
+pnpm install   # development baseline: published DSH 0.2.1-rc.5 packages
 pnpm build     # tsc (lib/) + tsdown (lib/client.js browser bundle)
 pnpm test      # node --test over compiled unit specs
 ```
+
+For the optional offline quota UI check, point `PLAYWRIGHT_PATH` at an installed Playwright package and run `node test/subscription-usage-browser.mjs`. It uses synthetic accounts and intercepted browser routes, without a DSH server or credentials.
+
+The published UI primitives' browser dependencies are listed as development dependencies for Node component tests. DSH supplies those libraries to the browser at runtime.
 
 `prepare` (used by git installs) runs `tsdown.prepare.config.ts`: a self-contained bundle build of both faces with all `@deepseek-ai/*` specifiers external — they resolve from the dsh installation at runtime, so this package never carries a second cordis copy.
 
