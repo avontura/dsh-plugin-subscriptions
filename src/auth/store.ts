@@ -18,6 +18,7 @@ import { decodeJwtPayload } from './jwt.js'
 import { readFile, rename, rm, stat } from 'node:fs/promises'
 import { writePrivateJson } from '../private-json.js'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
+import { parseJsonText } from '../json-text.js'
 
 /** Provider routes this plugin can serve. */
 export type ProviderId = 'codex' | 'claude' | 'grok' | 'copilot' | 'antigravity'
@@ -378,7 +379,7 @@ function fileSignature(stats: { ino: number; size: number; mtimeMs: number }): s
 function parseStore(text: string, path: string): SessionMap {
   let parsed: unknown
   try {
-    parsed = JSON.parse(text)
+    parsed = parseJsonText(text)
   } catch {
     throw new Error(`subscriptions auth store at ${path} is not valid JSON; fix or delete the file`)
   }
