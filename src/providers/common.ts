@@ -281,7 +281,7 @@ export interface AuthRetryStream<S, P> {
   /** Rate-limit reader and warning sink for a failed response. */
   errors?: HttpLlmErrorOptions
   /** Translate the response body into stream chunks, pulsing the watchdog on activity. */
-  parse: (body: ReadableStream<Uint8Array>, pulse: () => void, prepared: P) => AsyncIterable<StreamChunk>
+  parse: (body: ReadableStream<Uint8Array>, pulse: () => void, prepared: P, signal: AbortSignal) => AsyncIterable<StreamChunk>
 }
 
 /**
@@ -306,7 +306,7 @@ export async function* streamWithAuthRetry<S, P>(stream: AuthRetryStream<S, P>):
     if (response.body === null) {
       throw new LlmError(`${stream.label} returned no response body`, EMPTY_RESPONSE_CODE)
     }
-    yield* stream.parse(response.body, () => { watchdog.pulse() }, prepared)
+    yield* stream.parse(response.body, () => { watchdog.pulse() }, prepared, watchdog.signal)
   } catch (error: unknown) {
     throw mapFetchFailure(stream.label, error, watchdog, stream.caller)
   } finally {
@@ -552,6 +552,8 @@ export interface UsageWindow {
   scope?: string
   /** Percent of the window already consumed (0–100). */
   usedPercent: number
+  /** Total window length when known from provider telemetry (not time left until reset). */
+  durationMs?: number
   /** Epoch milliseconds at which the window resets, when the provider discloses it. */
   resetsAt?: number
 }
@@ -565,6 +567,13 @@ export interface ResetCredit {
 
 /** Subscription usage of one provider, as served by the `usage` RPC endpoint. */
 export interface ProviderUsage {
+  /** Display-only telemetry; does not affect routing or cooldown decisions. */
+  fetchedAt?: number
+  staleAt?: number
+  stale?: boolean
+  refreshFailed?: boolean
+  retryAt?: number
+
   /** False when the provider has no usage endpoint (grok); windows are absent then. */
   supported: boolean
   /** Usage windows in display order. */

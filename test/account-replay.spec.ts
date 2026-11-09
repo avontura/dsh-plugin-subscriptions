@@ -29,7 +29,7 @@ for (const mode of ['independent', 'pool'] as const) test(`${mode} routes retain
       // Image-free fixtures, so folding tool roles is the whole resolve step.
       wire = toAntigravityContents(withToolResultBlocks(options.messages as readonly ToolRoleMessage[]), options.model)
       const translator = new AntigravityStreamTranslator()
-      yield* translator.push({ response: { candidates: [{ content: { parts: [
+      yield* await translator.push({ response: { candidates: [{ content: { parts: [
         { thought: true, text: 'signed reasoning', thoughtSignature: `signature-${account}` }, { text: 'OK' },
       ] }, finishReason: 'STOP' }] } })
     }

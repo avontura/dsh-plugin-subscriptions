@@ -11,7 +11,7 @@ const css = registerHooks({ load(url, context, nextLoad) {
     ? { format: 'module', source: 'export default {}', shortCircuit: true }
     : nextLoad(url, context)
 } })
-const { AccountWindows, compactSegment, createCurrentModelReader, previewWindows,
+const { AccountWindows, CodexExhaustionNotice, compactSegment, createCurrentModelReader, previewWindows,
   collapsedDisplays, expandedDisplays, retainSubscriptionSelection, usageBadgeIcon } = await import('../src/client/SubscriptionUsageBadge.js')
 const { ImageGenerateToolview } = await import('../src/client/ImageGenerateToolview.js')
 const { VideoGenerateToolview } = await import('../src/client/VideoGenerateToolview.js')
@@ -19,6 +19,7 @@ css.deregister()
 import type { ProviderUsageDisplay } from '../src/client/SubscriptionUsageBadge.js'
 import type { UsageWindow } from '../src/client/SubscriptionsSection.js'
 import { en, zh } from '../src/client/locales.js'
+import { visibleUsageWindows } from '../src/client/usage-window-filter.js'
 
 test('media tool views render the preparing phase before arguments are available', () => {
   for (const [Component, name] of [[ImageGenerateToolview, 'image_generate'], [VideoGenerateToolview, 'video_generate']] as const) {
@@ -42,18 +43,39 @@ function display(provider: ProviderUsageDisplay['provider'] = 'antigravity', val
   ] }
 }
 
-test('Antigravity compact readout selects exact current model, not the entire catalog', () => {
-  const d = display('antigravity', [...windows, { kind: 'weekly', scope: 'gemini-model-59', usedPercent: 81 }])
-  assert.equal(compactSegment(d, 'gemini-model-59'), 'Antigravity Window 59% · Weekly 81%')
-  assert.equal(compactSegment(d), 'Antigravity 60 model quotas')
-  assert.equal(compactSegment(d, 'missing'), 'Antigravity Current model quota unavailable')
-  assert.ok(compactSegment(d, 'gemini-model-1').length < 60)
+test('Codex exhaustion notice renders localized credits and reset guidance only for all displayed exhausted accounts', () => {
+  const d = display('codex', [{ kind: 'weekly', usedPercent: 100 }])
+  d.accounts.push({ key: 'second', isDefault: false, windows: [{ kind: 'session', usedPercent: 105 }] })
+  for (const dictionary of [en, zh]) {
+    const translate = (key: keyof typeof en) => dictionary[key]
+    const render = () => renderToStaticMarkup(createElement(CodexExhaustionNotice, { display: d, translate }))
+    assert.match(render(), /role="status"/)
+    assert.ok(render().includes(dictionary.usageBadgeAllCodexExhausted))
+    d.accounts[1]!.windows[0]!.usedPercent = 99.99
+    assert.equal(render(), '', 'do not treat rounded 100% as exhaustion')
+    d.accounts[1]!.windows[0]!.usedPercent = Infinity
+    assert.equal(render(), '', 'non-finite telemetry is unknown, not exhaustion')
+    d.accounts[1]!.windows = []
+    assert.equal(render(), '', 'unknown usage is not known exhaustion')
+    d.accounts[1]!.windows = [{ kind: 'session', usedPercent: 105 }]
+  }
+  assert.equal(renderToStaticMarkup(createElement(CodexExhaustionNotice, {
+    display: display('claude', [{ kind: 'weekly', usedPercent: 100 }]), translate: key => en[key],
+  })), '')
 })
 
-test('compact summary uses default account and preserves bounded non-Antigravity windows', () => {
+test('Antigravity compact readout selects exact current model, not the entire catalog', () => {
+  const d = display('antigravity', [...windows, { kind: 'weekly', scope: 'gemini-model-59', usedPercent: 81 }])
+  assert.equal(compactSegment(d, 'gemini-model-59'), 'Antigravity · Default account Window 59% used · Weekly 81% used')
+  assert.equal(compactSegment(d), 'Antigravity · Default account 60 model quotas')
+  assert.equal(compactSegment(d, 'missing'), 'Antigravity · Default account Current model quota unavailable')
+  assert.ok(compactSegment(d, 'gemini-model-1').length < 90)
+})
+
+test('compact summary counts signed-in accounts without aggregating their percentages', () => {
   const d = display('codex', [{ kind: 'session', usedPercent: 13 }, { kind: 'weekly', usedPercent: 25 }])
   d.accounts.unshift({ key: 'other', isDefault: false, windows: [{ kind: 'session', usedPercent: 99 }] })
-  assert.equal(compactSegment(d), 'Codex 5h 13% · Wk 25%')
+  assert.equal(compactSegment(d), 'Codex · 2 signed-in accounts')
   assert.ok(compactSegment(display('codex')).endsWith('+58'))
 })
 
@@ -80,6 +102,27 @@ test('rendered account keeps other windows in a closed native disclosure with lo
     assert.ok(html.includes(translate('usageBadgeCurrent')))
     assert.ok(html.indexOf('gemini-model-59') < html.indexOf('<details'))
     assert.ok(html.includes('gemini-model-58'))
+  }
+})
+
+test('Google dialog previews and disclosure counts only include selected models', () => {
+  const filtered = visibleUsageWindows('antigravity', windows, ['gemini-model-1', 'gemini-model-59'])
+  const translate = (key: keyof typeof en, params?: Record<string, unknown>) =>
+    en[key].replace(/\{(\w+)\}/g, (_, name: string) => String(params?.[name] ?? ''))
+  const html = renderToStaticMarkup(createElement(AccountWindows, {
+    windows: filtered, model: 'gemini-model-59', provider: 'antigravity', translate,
+  }))
+  assert.equal((html.match(/<dt /g) ?? []).length, 2)
+  assert.ok(html.includes(translate('usageBadgeMoreWindows', { count: 1 })))
+  assert.ok(!html.includes('gemini-model-58'))
+  assert.equal(windows.length, 60)
+  for (const dictionary of [en, zh]) {
+    const empty = renderToStaticMarkup(createElement(AccountWindows, {
+      windows: [], model: 'gemini-model-59', provider: 'antigravity', translate: key => dictionary[key],
+    }))
+    assert.ok(empty.includes(dictionary.usageNoVisibleModels))
+    assert.ok(!empty.includes('<details'))
+    assert.ok(!empty.includes('<dt'))
   }
 })
 
@@ -157,4 +200,18 @@ test('model reader observes switches within the same provider and handles missin
   assert.deepEqual(await read(), { provider: 'antigravity', model: 'two' })
   assert.equal(await createCurrentModelReader(() => undefined, 'session')(), undefined)
   assert.equal(await createCurrentModelReader(() => ({ directoryFor: () => ({ load: async () => ({ current: null }) }) }), 'session')(), undefined)
+})
+
+
+test('single-account summaries identify fallback source, mode, stale data and unknown values', () => {
+  const d = display('claude', [{ kind: 'weekly', scope: 'Opus', usedPercent: 28 }])
+  d.accounts[0]!.isDefault = false
+  d.accounts[0]!.usage = { supported: true, stale: true, fetchedAt: 1 }
+  assert.match(compactSegment(d, undefined, undefined, 'remaining'), /Listed account.*72% remaining.*stale/)
+  d.accounts[0]!.windows[0]!.usedPercent = NaN
+  assert.match(compactSegment(d, undefined, undefined, 'remaining'), /Unknown quota/)
+  assert.doesNotMatch(compactSegment(d, undefined, undefined, 'remaining'), /100%/)
+  d.accounts.push({ key: 'unknown', isDefault: false, windows: [] })
+  assert.match(compactSegment(d), /2 signed-in accounts/)
+  assert.doesNotMatch(compactSegment(d), /%/)
 })
