@@ -20,7 +20,9 @@
  * user-visible string goes through the locale `t` of the
  * 'settings.subscriptions' namespace.
  */
-import { quotaPercent, quotaText, quotaIsStale, quotaUnavailableText, UsageFreshness, useQuotaClock } from './quota-display.js'
+import { antigravityQuotaApplies, antigravityQuotaScope } from '../antigravity-model-id.js'
+import { AntigravityQuotaSummary } from './AntigravityQuotaSummary.js'
+import { creditBalanceText, quotaPercent, quotaText, quotaIsStale, quotaUnavailableText, UsageFreshness, useQuotaClock } from './quota-display.js'
 import { readUsageCache, subscribeUsage, failUsage } from './usage-cache.js'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ComponentType, CSSProperties } from 'react'
@@ -29,7 +31,8 @@ import { createPortal } from 'react-dom'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
 import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
-import { useAnchoredPosition, useDismissOnOutsidePointer } from '@deepseek-ai/dsh-client-ui-primitives'
+import { useDismissOnOutsidePointer } from '@deepseek-ai/dsh-client-ui-primitives'
+import { useBadgePosition } from './use-badge-position.js'
 import { callSubscriptionsAuth, usageBarColor, usageWindowLabel } from './SubscriptionsSection.js'
 import type { AccountStatus, ProviderStatus, ProviderUsage, SubscriptionProvider, UsageWindow } from './SubscriptionsSection.js'
 import type { ModelDirectoriesLike } from './SpeedSelect.js'
@@ -97,14 +100,33 @@ export interface ProviderUsageDisplay {
 }
 
 /** Display-only warning; does not infer model eligibility or uncached accounts. */
+function accountWindowExhausted(account: AccountUsageDisplay): boolean {
+  return account.windows.some(window =>
+    window.scope === undefined && Number.isFinite(window.usedPercent) && window.usedPercent >= 100)
+}
+
+/** True when the displayed snapshot still has spendable Codex credits. */
+export function accountHasSpendableCredits(account: AccountUsageDisplay): boolean {
+  const credits = account.usage?.credits
+  if (credits === undefined || credits.overageLimitReached === true) return false
+  if (credits.unlimited) return true
+  if (credits.balance !== undefined) {
+    const balance = Number(credits.balance)
+    return Number.isFinite(balance) && balance > 0
+  }
+  return credits.hasCredits
+}
+
 export function CodexExhaustionNotice({ display, translate }: {
   display: ProviderUsageDisplay
   translate: (key: SubscriptionsKey) => string
 }) {
   if (display.provider !== 'codex' || display.accounts.length === 0
-    || !display.accounts.every(account => account.windows.some(window =>
-      window.scope === undefined && Number.isFinite(window.usedPercent) && window.usedPercent >= 100))) return null
-  return <p role="status">{translate('usageBadgeAllCodexExhausted')}</p>
+    || !display.accounts.every(accountWindowExhausted)) return null
+  const key = display.accounts.some(accountHasSpendableCredits)
+    ? 'usageBadgeCodexCreditsFallback'
+    : 'usageBadgeAllCodexExhausted'
+  return <p role="status">{translate(key)}</p>
 }
 
 /** The account the collapsed pill reads: the default one, else the first listed. */
@@ -164,20 +186,20 @@ export function windowLabel(w: UsageWindow): string {
 }
 
 /** Keep model quotas separate: matching percentages do not imply a shared pool. */
-export function prioritizeWindows(windows: readonly UsageWindow[], model?: string): UsageWindow[] {
+export function prioritizeWindows(windows: readonly UsageWindow[], model?: string, provider?: SubscriptionProvider): UsageWindow[] {
   return model === undefined ? [...windows] : [
-    ...windows.filter(w => w.scope === model),
-    ...windows.filter(w => w.scope !== model),
+    ...windows.filter(w => provider === 'antigravity' ? antigravityQuotaApplies(w.scope, model) : w.scope === model),
+    ...windows.filter(w => provider === 'antigravity' ? !antigravityQuotaApplies(w.scope, model) : w.scope !== model),
   ]
 }
 
 /** Small previews keep a live model catalog from taking over the dialog. */
 export const WINDOW_PREVIEW_LIMIT = 4
 export function previewWindows(windows: readonly UsageWindow[], model?: string, provider?: SubscriptionProvider) {
-  const ordered = prioritizeWindows(windows, model)
+  const ordered = prioritizeWindows(windows, model, provider)
   // Antigravity has many model-specific quotas: preview only the current model.
   const limit = provider === 'antigravity'
-    ? Math.min(2, model === undefined ? 0 : windows.filter(w => w.scope === model).length)
+    ? Math.min(2, model === undefined ? 0 : windows.filter(w => antigravityQuotaApplies(w.scope, model)).length)
     : WINDOW_PREVIEW_LIMIT
   return { shown: ordered.slice(0, limit), hidden: ordered.slice(limit) }
 }
@@ -193,18 +215,24 @@ export function compactSegment(d: ProviderUsageDisplay, model?: string, t: Trans
   const prefix = `${d.name} · ${source}`
   if (windows.length === 0) return `${prefix} · ${quotaUnavailableText(account.usage, account.loadFailed === true, t) ?? t('usageNoVisibleModels')}`
   if (d.provider === 'antigravity') {
-    const matching = model === undefined ? [] : windows.filter(w => w.scope === model)
+    const matching = model === undefined ? [] : windows.filter(w => antigravityQuotaApplies(w.scope, model))
     if (matching.length === 0) {
       return `${prefix} ${t(model === undefined ? 'usageBadgeModelCount' : 'usageBadgeModelUnavailable', {
         count: new Set(windows.map(w => w.scope).filter(Boolean)).size,
       })}${freshness}`
     }
-    const parts = matching.slice(0, 2).map(w => `${w.kind === 'weekly' ? t('usageWeekly') : t('usageWindow')} ${quotaText(w.usedPercent, mode, t)}`)
+    const parts = matching.slice(0, 2).map(w => {
+      const label = w.resetsAt !== undefined && w.resetsAt <= Date.now() ? t('quotaExpiredWindow')
+        : w.kind === 'weekly' ? t('usageWeekly')
+        : w.kind === 'session' ? t('usageFiveHourLimit') : t('usageWindow')
+      return `${label} ${quotaText(w.usedPercent, mode, t)}`
+    })
     return `${prefix} ${parts.join(' · ')}${freshness}`
   }
   const parts = windows.slice(0, 2).map(w => `${w.resetsAt !== undefined && w.resetsAt <= Date.now() ? t('quotaExpiredWindow') : windowLabel(w)} ${quotaText(w.usedPercent, mode, t)}`)
   if (windows.length > 2) parts.push(`+${windows.length - 2}`)
-  return `${prefix} ${parts.join(' · ')}${freshness}`
+  const credits = d.provider === 'codex' ? creditBalanceText(account.usage?.credits, t) : undefined
+  return `${prefix} ${parts.join(' · ')}${credits === undefined ? '' : ` · ${credits}`}${freshness}`
 }
 
 type ModelSelection = { provider: string; model: string }
@@ -454,7 +482,7 @@ export function SubscriptionUsageBadge({ rpc, currentModel, t }: SubscriptionUsa
     }
   }, [])
 
-  const pos = useAnchoredPosition({ open, anchorRef: rootRef, panelRef, side: 'top', gap: PANEL_GAP, margin: PANEL_MARGIN })
+  const pos = useBadgePosition(open, rootRef, panelRef, PANEL_GAP, PANEL_MARGIN)
   useDismissOnOutsidePointer(rootRef, open, setOpen, panelRef)
   useEffect(() => {
     if (!open) return
@@ -557,12 +585,16 @@ export function SubscriptionUsageBadge({ rpc, currentModel, t }: SubscriptionUsa
                     </div>
                   )}
                   <UsageFreshness usage={account.usage} failed={account.loadFailed === true} t={translate} />
+                  {d.provider === 'codex' && creditBalanceText(account.usage?.credits, translate) !== undefined && (
+                    <p style={styles.providerMeta}>{creditBalanceText(account.usage?.credits, translate)}</p>
+                  )}
                   {!!account.usage?.windows?.length && <AccountWindows
                     key={`${d.provider}:${badgeSelection?.model ?? ''}`}
                     windows={account.windows}
                     model={d.provider === badgeSelection?.provider ? badgeSelection.model : undefined}
                     provider={d.provider}
                     translate={translate}
+                    mode={quotaMode}
                   />}
                 </div>
               ))}
@@ -613,15 +645,18 @@ function AccountMeta({ account, translate }: { account: AccountUsageDisplay; tra
 }
 
 /** Preview each account independently; remaining visible quotas stay accessible. */
-export function AccountWindows({ windows, model, provider, translate }: {
-  windows: readonly UsageWindow[]; model: string | undefined; provider?: SubscriptionProvider; translate: Translate
+export function AccountWindows({ windows, model, provider, translate, mode }: {
+  windows: readonly UsageWindow[]; model: string | undefined; provider?: SubscriptionProvider; translate: Translate; mode?: QuotaDisplayMode | undefined
 }) {
   if (windows.length === 0) return <p style={styles.providerMeta}>{translate('usageNoVisibleModels')}</p>
+  if (provider === 'antigravity' && windows.some(window => antigravityQuotaScope(window.scope))) {
+    return <AntigravityQuotaSummary windows={windows} t={translate} mode={mode} />
+  }
   const { shown, hidden } = previewWindows(windows, model, provider)
   const rows = (items: readonly UsageWindow[]) => (
     <dl style={styles.details}>
       {items.map((w, i) => (
-        <WindowRow key={i} label={`${usageWindowLabel(translate, w)}${model !== undefined && w.scope === model ? ` · ${translate('usageBadgeCurrent')}` : ''}`} window={w} translate={translate} />
+        <WindowRow key={i} label={`${usageWindowLabel(translate, w)}${model !== undefined && (provider === 'antigravity' ? antigravityQuotaApplies(w.scope, model) : w.scope === model) ? ` · ${translate('usageBadgeCurrent')}` : ''}`} window={w} translate={translate} mode={mode} />
       ))}
     </dl>
   )
@@ -635,14 +670,15 @@ export function AccountWindows({ windows, model, provider, translate }: {
 }
 
 /** One `dt`/`dd` pair: window name → `25% · 6d 1h`, with the bar underneath. */
-function WindowRow({ label, window: w, translate }: { label: string; window: UsageWindow; translate: Translate }) {
-  const mode = useQuotaDisplayMode()
-  const percent = quotaPercent(w.usedPercent, mode)
+function WindowRow({ label, window: w, translate, mode }: { label: string; window: UsageWindow; translate: Translate; mode?: QuotaDisplayMode | undefined }) {
+  const selectedMode = useQuotaDisplayMode()
+  const quotaMode = mode ?? selectedMode
+  const percent = quotaPercent(w.usedPercent, quotaMode)
   return (
     <>
       <dt style={styles.dt}>{label}</dt>
       <dd style={{ ...styles.dd, color: usageBarColor(w.usedPercent) }}>
-        {quotaText(w.usedPercent, mode, translate)}
+        {quotaText(w.usedPercent, quotaMode, translate)}
         {w.resetsAt !== undefined && <span style={styles.reset}> · {w.resetsAt <= Date.now() ? translate('quotaExpiredWindow') : windowLabel(w)}</span>}
       </dd>
       <div style={styles.bar} aria-hidden>
@@ -654,7 +690,7 @@ function WindowRow({ label, window: w, translate }: { label: string; window: Usa
 
 /**
  * Unplaced portal panel: hidden but laid out so the clamp measures real
- * dimensions (the `useAnchoredPosition` measure pass).
+ * dimensions before placement.
  */
 const MEASURE_STYLE: CSSProperties = { visibility: 'hidden', left: 0, top: 0 }
 

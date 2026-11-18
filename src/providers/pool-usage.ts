@@ -10,6 +10,7 @@
  * `quota_aware` strategy therefore prefers the highest-urgency member, which
  * over time converges on every window hitting zero right at its reset.
  */
+import { antigravityQuotaApplies } from '../antigravity-model-id.js'
 
 import { isMissingOrInvalidCredential, OAuthEndpointError } from './common.js'
 import type { ProviderUsage, UsageWindow } from './common.js'
@@ -18,7 +19,10 @@ import type { ConcretePoolMember } from './pool-family.js'
 
 /** Near-full members are tried only after members below this fill level. */
 export const QUOTA_FULL_PERCENT = 95
-/** Exhausted subscription windows must not silently spill over into paid credits. */
+/**
+ * Exhausted subscription windows stop routing unless Codex reports remaining
+ * purchased credits. A missing or zero balance is not permission to spend.
+ */
 export const QUOTA_EXHAUSTED_PERCENT = 100
 /** How long a usage snapshot is trusted before a background refresh. */
 export const USAGE_TTL_MS = 5 * 60_000
@@ -34,8 +38,13 @@ const FALLBACK_HORIZON_MS: Record<UsageWindow['kind'], number> = {
 export interface MemberQuota {
   /** False when a window is near-full or the login is gone. */
   available: boolean
-  /** A known exhausted window: exclude even if the upstream would accept paid credits. */
+  /** A known exhausted window with no remaining Codex credits. */
   exhausted?: true
+  /**
+   * Included windows are exhausted, but Codex still reports spendable credits.
+   * Ranked after every account that still has included quota.
+   */
+  creditFunded?: true
   /** Burn rate in strategy-specific units; 0 when unmeasured. */
   urgency: number
   /** Epoch ms of the snapshot this was computed from; 0 when none. */
@@ -97,13 +106,16 @@ export class PoolUsageTracker {
   /**
    * The quota view of one member. A cold cache awaits the first fetch; a
    * stale non-exhausted snapshot answers immediately while refreshing in the
-   * background. Exhausted snapshots await their expired-cache refresh so a
-   * reset can restore routing on this call. A live failure cooldown never
-   * triggers another fetch.
+   * background. Exhausted snapshots, and Codex accounts already known to be
+   * spending credits, await their expired-cache refresh so a reset or a
+   * depleted balance can change routing on this call. A live failure cooldown
+   * never triggers another fetch.
    *
-   * Failures discard stale urgency but preserve known exhaustion: an outage
-   * must not turn a blocked subscription into permission to spend credits.
-   * Only a successful usage lookup (or explicit invalidation) clears it.
+   * Failures discard stale urgency but preserve known exhaustion and a known
+   * credit-funded fallback. An outage must not turn a blocked subscription
+   * into permission to spend credits, and must not hide a balance that was
+   * already confirmed. Only a successful usage lookup (or explicit
+   * invalidation) clears either state.
    * @param member - the pool member to score (account resolved).
    * @returns availability plus the urgency score.
    */
@@ -117,7 +129,7 @@ export class PoolUsageTracker {
       if (entry.snapshot !== undefined) {
         const quota = this.score(member, entry, normalized)
         if (fresh) return quota
-        if (!quota.exhausted && entry.at !== Number.NEGATIVE_INFINITY) {
+        if (!quota.exhausted && !quota.creditFunded && entry.at !== Number.NEGATIVE_INFINITY) {
           void this.refresh(key, fetcher).catch(() => undefined)
           return quota
         }
@@ -135,12 +147,12 @@ export class PoolUsageTracker {
     }
   }
 
-  /** Keep a known credit-spending risk blocked through usage-endpoint failures. */
+  /** Keep a known blocked or credit-funded state through usage-endpoint failures. */
   private failedQuota(member: ConcretePoolMember, error: unknown, snapshot?: ProviderUsage): MemberQuota {
     const degraded = degradedQuota(error)
-    if (snapshot !== undefined && this.score(member, { snapshot, at: 0 }).exhausted) {
-      return { ...degraded, available: false, exhausted: true }
-    }
+    const previous = snapshot === undefined ? undefined : this.score(member, { snapshot, at: 0 })
+    if (previous?.exhausted) return { ...degraded, available: false, exhausted: true }
+    if (previous?.creditFunded) return { ...degraded, available: false, urgency: 0, creditFunded: true }
     return degraded
   }
 
@@ -267,16 +279,41 @@ export class PoolUsageTracker {
 
   /** Score one member against a snapshot's windows. */
   private score(member: ConcretePoolMember, entry: SnapshotEntry, normalized = false): MemberQuota {
-    const windows = (entry.snapshot.windows ?? []).filter(window => windowApplies(window, member.model))
+    const windows = (entry.snapshot.windows ?? []).filter(window => windowApplies(window, member.model, member.provider))
     let available = true
     let urgency = 0
     for (const window of windows) {
       if (window.usedPercent >= QUOTA_FULL_PERCENT) available = false
       urgency = Math.max(urgency, normalized ? normalizedWindowUrgency(window, Date.now()) : windowUrgency(window))
     }
-    const exhausted = windows.some(window => window.usedPercent >= QUOTA_EXHAUSTED_PERCENT)
-    return { available, urgency, fetchedAt: entry.at, ...exhausted ? { exhausted: true as const } : {} }
+    const windowExhausted = windows.some(window => window.usedPercent >= QUOTA_EXHAUSTED_PERCENT)
+    const creditFunded = windowExhausted && codexCreditsFunded(entry.snapshot, member.provider)
+    const exhausted = windowExhausted && !creditFunded
+    return {
+      available: available && !creditFunded,
+      urgency: creditFunded ? 0 : urgency,
+      fetchedAt: entry.at,
+      ...exhausted ? { exhausted: true as const } : {},
+      ...creditFunded ? { creditFunded: true as const } : {},
+    }
   }
+}
+
+/**
+ * Whether a Codex account may keep serving after its included windows are
+ * exhausted. Only an unlimited flag or a positive reported balance counts;
+ * a missing snapshot, a zero balance, or an overage block does not.
+ */
+export function codexCreditsFunded(snapshot: ProviderUsage, provider: ProviderId): boolean {
+  if (provider !== 'codex') return false
+  const credits = snapshot.credits
+  if (credits === undefined || credits.overageLimitReached === true) return false
+  if (credits.unlimited) return true
+  if (credits.balance !== undefined) {
+    const balance = Number(credits.balance)
+    return Number.isFinite(balance) && balance > 0
+  }
+  return credits.hasCredits
 }
 
 /**
@@ -301,8 +338,9 @@ function cooldownFor(error: unknown, defaultTtlMs: number): number {
  * model-scoped window (Claude's Opus/Sonnet lanes) applies when its scope
  * names the model family.
  */
-function windowApplies(window: UsageWindow, model: string): boolean {
+function windowApplies(window: UsageWindow, model: string, provider: ProviderId): boolean {
   if (window.scope === undefined) return true
+  if (provider === 'antigravity' && antigravityQuotaApplies(window.scope, model)) return true
   return model.toLowerCase().includes(window.scope.toLowerCase())
 }
 

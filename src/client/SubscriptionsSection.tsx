@@ -11,7 +11,7 @@
  * 'settings.subscriptions' namespace. Buttons and inputs take the
  * native settings vocabulary with shared, scoped control states.
  */
-import { quotaPercent, quotaText, UsageFreshness, useQuotaClock } from './quota-display.js'
+import { creditBalanceText, quotaPercent, quotaText, UsageFreshness, useQuotaClock } from './quota-display.js'
 import { useQuotaDisplayMode } from './usage-badge-preferences.js'
 import { readUsageCache, subscribeUsage } from './usage-cache.js'
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -19,6 +19,8 @@ import type { CSSProperties } from 'react'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
 import { fallbackTranslate } from './locales.js'
 import { resetActionBlock } from './reset-action.js'
+import { AntigravityQuotaSummary } from './AntigravityQuotaSummary.js'
+import { antigravityQuotaScope } from '../antigravity-model-id.js'
 import { visibleUsageWindows } from './usage-window-filter.js'
 import { ProviderAccountManager } from './ProviderAccountManager.js'
 import { providerSettingsCss } from './provider-settings-styles.js'
@@ -75,6 +77,14 @@ interface StatusResponse {
   providers: Record<SubscriptionProvider, ProviderStatus>
 }
 
+/** Purchased Codex credit balance. Not a usage-limit reset card. */
+export interface CreditBalance {
+  hasCredits: boolean
+  unlimited: boolean
+  balance?: string
+  overageLimitReached?: boolean
+}
+
 /** One rate-limit window as answered by the `usage` endpoint. */
 export interface UsageWindow {
   kind: 'session' | 'weekly' | 'other'
@@ -97,6 +107,8 @@ export interface ProviderUsage {
   supported: boolean
   windows?: UsageWindow[]
   plan?: string
+  /** Remaining purchased Codex credits from `wham/usage`, when disclosed. */
+  credits?: CreditBalance
   resetCredits?: { id?: string; grantedAt?: number; expiresAt?: number }[]
   resetCreditsError?: string
 }
@@ -959,7 +971,9 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                       {usage?.windows !== undefined && usage.windows.length > 0 && shownWindows.length === 0 && (
                         <p style={styles.statusLine}>{t('usageNoVisibleModels')}</p>
                       )}
-                      {shownWindows.map((window, index) => {
+                      {id === 'antigravity' && shownWindows.some(window => antigravityQuotaScope(window.scope))
+                        ? <AntigravityQuotaSummary windows={shownWindows} t={t} mode={quotaMode} />
+                        : shownWindows.map((window, index) => {
                         const percent = quotaPercent(window.usedPercent, quotaMode)
                         return (
                           <div key={index} style={styles.usageRow}>
@@ -977,6 +991,13 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                           </div>
                         )
                       })}
+                      {id === 'codex' && creditBalanceText(usage?.credits, t) !== undefined && (
+                        <div style={styles.usageRow}>
+                          <div style={styles.usageMeta}>
+                            <span>{creditBalanceText(usage?.credits, t)}</span>
+                          </div>
+                        </div>
+                      )}
                       {id === 'codex' && usage?.resetCreditsError !== undefined && (
                         <p style={styles.errorLine}>{t('resetCreditsError', { message: usage.resetCreditsError })}</p>
                       )}
