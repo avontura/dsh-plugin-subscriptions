@@ -47,11 +47,12 @@ for (const includePrerelease of [false, true]) {
     }
   })
 
-  test(`${mode}: admits all current 0.2.1 prereleases without per-RC entries`, () => {
+  test(`${mode}: admits 0.2.1 and 0.2.2 prereleases without per-RC entries`, () => {
     for (const version of [
       '0.2.1-0', '0.2.1-alpha.1', '0.2.1-alpha.2', '0.2.1-alpha.3',
       '0.2.1-alpha.4', '0.2.1-beta.1', '0.2.1-rc.1', '0.2.1-rc.2', '0.2.1-rc.3',
       '0.2.1-rc.4', '0.2.1-rc.5', '0.2.1-rc.99',
+      '0.2.2-0', '0.2.2-alpha.1', '0.2.2-rc.1', '0.2.2-rc.3', '0.2.2-rc.4',
     ]) {
       for (const [name, range] of peers) {
         assert.equal(semver.satisfies(version, range, options), true, `${name}: ${version}`)

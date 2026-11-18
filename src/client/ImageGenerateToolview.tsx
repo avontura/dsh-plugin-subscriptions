@@ -20,9 +20,10 @@ import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
 import { ImageGallery } from './ImageGallery.js'
 import type { ImageAttachmentRef, ImageLoader, MessageImageLabels } from './ImageGallery.js'
 import { hostIcon } from './host-icons.js'
+import { mediaArguments } from './media-arguments.js'
 import { callSubscriptionsAuth } from './subscriptions-rpc.js'
 import { fallbackTranslate } from './locales.js'
-import { derivePrompt, resultText } from './toolview-shared.js'
+import { resultText } from './toolview-shared.js'
 import type { SubscriptionsKey } from './locales.js'
 
 /** DSH 0.1.7 renamed IconSparkle16; resolving it by name keeps older hosts working too. */
@@ -115,13 +116,8 @@ export function ImageGenerateToolview(props: ImageGenerateToolviewProps) {
   const t = props.t ?? fallbackTranslate
   if (block === undefined) return null
   const settled = 'kind' in block
-  const argsRaw = (settled ? block.call?.argsRaw : 'argsRaw' in block ? block.argsRaw : undefined) ?? ''
-  let references = 0
-  try {
-    const args = JSON.parse(argsRaw)
-    if (Array.isArray(args?.referenceImages)) references = args.referenceImages.length
-  } catch { /* Arguments may still be streaming. */ }
-  const title = `image_generate${references > 0 ? ` (${references} ref)` : ''}: ${derivePrompt(argsRaw)}`
+  const { prompt, references } = mediaArguments(block)
+  const title = `image_generate${references > 0 ? ` (${references} ref)` : ''}: ${prompt}`
   const images = resultImages(block)
   const text = settled ? resultText(block) : ''
   const labels: MessageImageLabels = {
